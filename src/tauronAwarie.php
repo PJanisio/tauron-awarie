@@ -9,10 +9,10 @@ github: https://github.com/PJanisio/tauron-awarie
 
 class TauronOutageCron
 {
-
     private const API_URL = 'https://www.tauron-dystrybucja.pl/waapi/outages/area';
     private const FETCH_RANGE_DAYS = 7;
     private const JSON_RETENTION_DAYS = 30; // Keep generated JSONs for 30 days
+    private const JSON_OUTPUT_DIR = __DIR__; // Default directory for JSON files
 
     private bool $silent;
     private bool $debug;
@@ -32,13 +32,16 @@ class TauronOutageCron
 
     private function cleanupOldJsonFiles(): void
     {
-        $files = glob(__DIR__ . '/outages_*.json');
+        $dir = rtrim(self::JSON_OUTPUT_DIR, '/\\');
+        $files = glob($dir . '/outages_*.json');
         $cutoff = time() - (self::JSON_RETENTION_DAYS * 86400);
 
-        foreach ($files as $file) {
-            if (is_file($file) && filemtime($file) < $cutoff) {
-                unlink($file);
-                $this->logDebug("Deleted old JSON file: " . basename($file));
+        if ($files !== false) {
+            foreach ($files as $file) {
+                if (is_file($file) && filemtime($file) < $cutoff) {
+                    unlink($file);
+                    $this->logDebug("Deleted old JSON file: " . basename($file));
+                }
             }
         }
     }
@@ -47,11 +50,12 @@ class TauronOutageCron
     {
         // Run cleanup of outdated JSON files before proceeding
         $this->cleanupOldJsonFiles();
+        
         $this->logDebug("Starting check for: $cityName, $street $houseNumber");
         $gaids = $this->getGaidsForCity($cityName);
         
         if (!$gaids) {
-            $this->logDebug("Nie znaleziono miejscowości w dynamicznym API Tauron: {$cityName}");
+            $this->logDebug("City not found in dynamic Tauron API: {$cityName}");
             return;
         }
 
@@ -67,9 +71,9 @@ class TauronOutageCron
         $this->filterAndSaveResults($outages, $cityName, $street, $houseNumber);
     }
 
-   private function getGaidsForCity(string $targetCity): ?array
+    private function getGaidsForCity(string $targetCity): ?array
     {
-        $this->logDebug("Odpytywanie WAAPI Tauron (na żywo) o miejscowość: {$targetCity}");
+        $this->logDebug("Querying WAAPI Tauron (live) for city: {$targetCity}");
         
         // Generate timestamp in milliseconds (cache-buster similar to jQuery)
         $timestamp = (int)(microtime(true) * 1000);
@@ -91,16 +95,22 @@ class TauronOutageCron
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
 
         if ($httpCode !== 200 || $response === false) {
-            $this->logDebug("Błąd pobierania słownika. HTTP Code: {$httpCode}");
+            $this->logDebug("Dictionary API error. HTTP Code: {$httpCode}, cURL Error: {$curlError}");
             return null;
         }
 
         $cities = json_decode($response, true);
         
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $this->logDebug("JSON decode error (Cities): " . json_last_error_msg());
+            return null;
+        }
+        
         if (empty($cities) || !is_array($cities)) {
-            $this->logDebug("API słownikowe zwróciło pustą listę.");
+            $this->logDebug("Dictionary API returned an empty or invalid list.");
             return null;
         }
 
@@ -113,7 +123,7 @@ class TauronOutageCron
             $nameLower = mb_strtolower($name, 'UTF-8');
             
             if ($nameLower === $targetCityLower) {
-                $this->logDebug("Znaleziono idealne dopasowanie API dla: {$name}");
+                $this->logDebug("Found exact API match for: {$name}");
                 return [
                     'provinceGaid' => (int)($cityData['ProvinceGAID'] ?? 0),
                     'districtGaid' => (int)($cityData['DistrictGAID'] ?? 0),
@@ -123,14 +133,14 @@ class TauronOutageCron
             
             if (str_contains($nameLower, $targetCityLower)) {
                 $district = trim($cityData['DistrictName'] ?? 'unknown');
-                $suggestions[] = "$name (pow. $district)";
+                $suggestions[] = "$name (district: $district)";
             }
         }
 
         if (!empty($suggestions)) {
-            $this->logDebug("Brak dokładnego dopasowania. Podobne miejscowości w API: " . implode(', ', $suggestions));
+            $this->logDebug("No exact match. Similar cities in API: " . implode(', ', $suggestions));
         } else {
-            $this->logDebug("Miejscowość '{$targetCity}' nie została znaleziona w dynamicznej odpowiedzi API.");
+            $this->logDebug("City '{$targetCity}' not found in dynamic API response.");
         }
         
         return null;
@@ -164,15 +174,22 @@ class TauronOutageCron
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
 
         if ($httpCode !== 200 || $response === false) {
-            $this->logDebug("API request failed with HTTP code: {$httpCode}");
-            error_log("Błąd komunikacji z API Tauron. HTTP Code: $httpCode");
+            $this->logDebug("API request failed. HTTP Code: {$httpCode}, cURL Error: {$curlError}");
+            error_log("Tauron API communication error. HTTP Code: $httpCode, cURL Error: $curlError");
             return [];
         }
 
         $this->logDebug("API request successful, parsing JSON response.");
         $data = json_decode($response, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $this->logDebug("JSON decode error (Outages): " . json_last_error_msg());
+            return [];
+        }
+
         return $data['OutageItems'] ?? [];
     }
 
@@ -212,15 +229,22 @@ class TauronOutageCron
         
         $safeCityName = preg_replace('/[^\p{L}0-9_\-]/u', '_', $cityName);
         $filename = sprintf('outages_%s_%s.json', $safeCityName, $extractionTime->format('Y-m-d_His'));
-        $outputPath = __DIR__ . '/' . $filename;
+        
+        $dir = rtrim(self::JSON_OUTPUT_DIR, '/\\');
+        $outputPath = $dir . '/' . $filename;
+        
         $jsonString = json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
         
-        file_put_contents($outputPath, $jsonString);
-        $this->logDebug("Results successfully saved to " . $outputPath);
+        // Optimize: Check if file was successfully written
+        if (file_put_contents($outputPath, $jsonString) !== false) {
+            $this->logDebug("Results successfully saved to " . $outputPath);
+        } else {
+            $this->logDebug("Failed to save results to " . $outputPath);
+            error_log("TauronOutageCron: Failed to save JSON file to $outputPath");
+        }
 
         if (!$this->silent) {
             echo "<pre>\n" . htmlspecialchars($jsonString) . "\n</pre>\n";
         }
     }
-    
 }
