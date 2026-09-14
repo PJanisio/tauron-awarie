@@ -17,12 +17,23 @@ class TauronOutageCron
     private bool $silent;
     private bool $debug;
 
+    /**
+     * Initializes the cron class with output visibility settings.
+     * 
+     * @param bool $silent If true, disables direct output to the browser/console (except debug).
+     * @param bool $debug If true, prints execution steps and error details.
+     */
     public function __construct(bool $silent = true, bool $debug = false)
     {
         $this->silent = $silent;
         $this->debug = $debug;
     }
 
+    /**
+     * Outputs debug messages if debug mode is enabled.
+     * 
+     * @param string $message The debug information to display.
+     */
     private function logDebug(string $message): void
     {
         if ($this->debug) {
@@ -30,6 +41,10 @@ class TauronOutageCron
         }
     }
 
+    /**
+     * Removes outdated JSON files from the output directory based on the retention policy.
+     * Keeps the directory clean from obsolete outage reports.
+     */
     private function cleanupOldJsonFiles(): void
     {
         $dir = rtrim(self::JSON_OUTPUT_DIR, '/\\');
@@ -46,14 +61,22 @@ class TauronOutageCron
         }
     }
 
+    /**
+     * Main entry point to check power outages for a single location.
+     * Fetches city IDs, retrieves area outages, filters by street, and saves the result.
+     * 
+     * @param string $cityName Name of the city to check.
+     * @param string $street Name of the street to filter the outages by.
+     * @param string $houseNumber House number for exact location logging.
+     */
     public function checkOutages(string $cityName, string $street, string $houseNumber): void
     {
         // Run cleanup of outdated JSON files before proceeding
         $this->cleanupOldJsonFiles();
-        
         $this->logDebug("Starting check for: $cityName, $street $houseNumber");
-        $gaids = $this->getGaidsForCity($cityName);
         
+        $gaids = $this->getGaidsForCity($cityName);
+
         if (!$gaids) {
             $this->logDebug("City not found in dynamic Tauron API: {$cityName}");
             return;
@@ -67,20 +90,52 @@ class TauronOutageCron
             $this->logDebug("No outages returned from API for this area.");
         }
 
-        // Pass cityName as well so it can be saved in the JSON output
+        // Pass all location details so they can be saved in the JSON output
         $this->filterAndSaveResults($outages, $cityName, $street, $houseNumber);
     }
 
+    /**
+     * Batch checks outages for multiple locations maintaining backward compatibility.
+     * Processes an array of location arrays sequentially.
+     * 
+     * @param array $locations Array of associative arrays with keys: 'cityName', 'street', 'houseNumber'
+     */
+    public function checkMultipleLocations(array $locations): void
+    {
+        $this->logDebug("Starting batch check for " . count($locations) . " locations.");
+
+        foreach ($locations as $index => $location) {
+            $city = $location['cityName'] ?? '';
+            $street = $location['street'] ?? '';
+            $house = $location['houseNumber'] ?? '';
+
+            if (!empty($city)) {
+                $this->logDebug("--- Processing location [" . ($index + 1) . "]: $city, $street $house ---");
+                // Reuse existing method to maintain 100% backward compatibility
+                $this->checkOutages($city, $street, $house);
+            } else {
+                $this->logDebug("Skipped location [" . ($index + 1) . "]: Missing cityName.");
+            }
+        }
+    }
+
+    /**
+     * Queries the live Tauron WAAPI dictionary endpoint to find geographical IDs (GAIDs) for a given city.
+     * Simulates an XMLHttpRequest to bypass potential basic scraping blocks.
+     * 
+     * @param string $targetCity The name of the city to resolve.
+     * @return array|null Associative array containing 'provinceGaid', 'districtGaid', and 'communeGaid', or null on failure.
+     */
     private function getGaidsForCity(string $targetCity): ?array
     {
         $this->logDebug("Querying WAAPI Tauron (live) for city: {$targetCity}");
-        
+
         // Generate timestamp in milliseconds (cache-buster similar to jQuery)
         $timestamp = (int)(microtime(true) * 1000);
-        
+
         // Correct endpoint from network debug
         $url = 'https://www.tauron-dystrybucja.pl/waapi/enum/geo/cities?partName=' . urlencode($targetCity) . '&_=' . $timestamp;
-        
+
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -95,20 +150,19 @@ class TauronOutageCron
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
 
         if ($httpCode !== 200 || $response === false) {
-            $this->logDebug("Dictionary API error. HTTP Code: {$httpCode}, cURL Error: {$curlError}");
+            $this->logDebug("Dictionary API error. HTTP Code: {$httpCode}");
             return null;
         }
 
         $cities = json_decode($response, true);
-        
+
         if (json_last_error() !== JSON_ERROR_NONE) {
             $this->logDebug("JSON decode error (Cities): " . json_last_error_msg());
             return null;
         }
-        
+
         if (empty($cities) || !is_array($cities)) {
             $this->logDebug("Dictionary API returned an empty or invalid list.");
             return null;
@@ -121,16 +175,16 @@ class TauronOutageCron
             // Securely fetch keys according to WAAPI JSON standard
             $name = trim($cityData['Name'] ?? '');
             $nameLower = mb_strtolower($name, 'UTF-8');
-            
+
             if ($nameLower === $targetCityLower) {
                 $this->logDebug("Found exact API match for: {$name}");
                 return [
                     'provinceGaid' => (int)($cityData['ProvinceGAID'] ?? 0),
                     'districtGaid' => (int)($cityData['DistrictGAID'] ?? 0),
-                    'communeGaid'  => (int)($cityData['OwnerGAID'] ?? 0), 
+                    'communeGaid'  => (int)($cityData['OwnerGAID'] ?? 0),
                 ];
             }
-            
+
             if (str_contains($nameLower, $targetCityLower)) {
                 $district = trim($cityData['DistrictName'] ?? 'unknown');
                 $suggestions[] = "$name (district: $district)";
@@ -142,10 +196,17 @@ class TauronOutageCron
         } else {
             $this->logDebug("City '{$targetCity}' not found in dynamic API response.");
         }
-        
+
         return null;
     }
 
+    /**
+     * Fetches all registered outages for a specific geographical area defined by GAIDs.
+     * Uses a configured date range extending from the current UTC time.
+     * 
+     * @param array $gaids Area identifiers containing province, district, and commune GAIDs.
+     * @return array List of outage items from the API, or an empty array on failure.
+     */
     private function fetchOutagesFromApi(array $gaids): array
     {
         $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
@@ -193,6 +254,15 @@ class TauronOutageCron
         return $data['OutageItems'] ?? [];
     }
 
+    /**
+     * Filters the raw API outage data to match the provided street name.
+     * Converts timezones, constructs the final data array, and exports it to a nicely formatted JSON file.
+     * 
+     * @param array $outages Raw array of outages retrieved from the API.
+     * @param string $cityName Original city name used for file naming and data structure.
+     * @param string $street Street name used to filter outage messages.
+     * @param string $houseNumber House number included in the final data output.
+     */
     private function filterAndSaveResults(array $outages, string $cityName, string $street, string $houseNumber): void
     {
         $affectedOutages = [];
@@ -204,7 +274,7 @@ class TauronOutageCron
         foreach ($outages as $outage) {
             $message = $outage['Message'] ?? '';
             $messageLower = mb_strtolower($message, 'UTF-8');
-            
+
             if (str_contains($messageLower, $streetLower)) {
                 $startDate = (new DateTimeImmutable($outage['StartDate']))->setTimezone($targetTimeZone);
                 $endDate   = (new DateTimeImmutable($outage['EndDate']))->setTimezone($targetTimeZone);
@@ -226,16 +296,19 @@ class TauronOutageCron
             'is_affected'     => !empty($affectedOutages),
             'outages'         => $affectedOutages
         ];
-        
+
+        // Sanitize both city and street name to avoid file overwriting in batch mode
         $safeCityName = preg_replace('/[^\p{L}0-9_\-]/u', '_', $cityName);
-        $filename = sprintf('outages_%s_%s.json', $safeCityName, $extractionTime->format('Y-m-d_His'));
+        $safeStreetName = preg_replace('/[^\p{L}0-9_\-]/u', '_', $street);
+        $filename = sprintf('outages_%s_%s_%s.json', $safeCityName, $safeStreetName, $extractionTime->format('Y-m-d_His'));
         
         $dir = rtrim(self::JSON_OUTPUT_DIR, '/\\');
-        $outputPath = $dir . '/' . $filename;
+        $outputPath = $dir . DIRECTORY_SEPARATOR . $filename;
         
-        $jsonString = json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        
-        // Optimize: Check if file was successfully written
+        // Use JSON_UNESCAPED_SLASHES to keep URLs and dates clean
+        $jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES;
+        $jsonString = json_encode($output, $jsonFlags);
+
         if (file_put_contents($outputPath, $jsonString) !== false) {
             $this->logDebug("Results successfully saved to " . $outputPath);
         } else {
