@@ -73,9 +73,8 @@ class TauronOutageCron
     {
         // Run cleanup of outdated JSON files before proceeding
         $this->cleanupOldJsonFiles();
-        
         $this->logDebug("Starting check for: $cityName, $street $houseNumber");
-
+        
         $gaids = $this->getGaidsForCity($cityName);
 
         if (!$gaids) {
@@ -95,10 +94,42 @@ class TauronOutageCron
         $this->filterAndSaveResults($outages, $cityName, $street, $houseNumber);
     }
 
+    /**
+     * Batch checks outages for multiple locations maintaining backward compatibility.
+     * Processes an array of location arrays sequentially.
+     * 
+     * @param array $locations Array of associative arrays with keys: 'cityName', 'street', 'houseNumber'
+     */
+    public function checkMultipleLocations(array $locations): void
+    {
+        $this->logDebug("Starting batch check for " . count($locations) . " locations.");
+
+        foreach ($locations as $index => $location) {
+            $city = $location['cityName'] ?? '';
+            $street = $location['street'] ?? '';
+            $house = $location['houseNumber'] ?? '';
+
+            if (!empty($city)) {
+                $this->logDebug("--- Processing location [" . ($index + 1) . "]: $city, $street $house ---");
+                // Reuse existing method to maintain 100% backward compatibility
+                $this->checkOutages($city, $street, $house);
+            } else {
+                $this->logDebug("Skipped location [" . ($index + 1) . "]: Missing cityName.");
+            }
+        }
+    }
+
+    /**
+     * Queries the live Tauron WAAPI dictionary endpoint to find geographical IDs (GAIDs) for a given city.
+     * Simulates an XMLHttpRequest to bypass potential basic scraping blocks.
+     * 
+     * @param string $targetCity The name of the city to resolve.
+     * @return array|null Associative array containing 'provinceGaid', 'districtGaid', and 'communeGaid', or null on failure.
+     */
     private function getGaidsForCity(string $targetCity): ?array
     {
         $this->logDebug("Querying WAAPI Tauron (live) for city: {$targetCity}");
-        
+
         // Generate timestamp in milliseconds (cache-buster similar to jQuery)
         $timestamp = (int)(microtime(true) * 1000);
 
@@ -119,20 +150,19 @@ class TauronOutageCron
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlError = curl_error($ch);
 
         if ($httpCode !== 200 || $response === false) {
-            $this->logDebug("Dictionary API error. HTTP Code: {$httpCode}, cURL Error: {$curlError}");
+            $this->logDebug("Dictionary API error. HTTP Code: {$httpCode}");
             return null;
         }
 
         $cities = json_decode($response, true);
-        
+
         if (json_last_error() !== JSON_ERROR_NONE) {
             $this->logDebug("JSON decode error (Cities): " . json_last_error_msg());
             return null;
         }
-        
+
         if (empty($cities) || !is_array($cities)) {
             $this->logDebug("Dictionary API returned an empty or invalid list.");
             return null;
@@ -269,14 +299,16 @@ class TauronOutageCron
 
         // Sanitize both city and street name to avoid file overwriting in batch mode
         $safeCityName = preg_replace('/[^\p{L}0-9_\-]/u', '_', $cityName);
-        $filename = sprintf('outages_%s_%s.json', $safeCityName, $extractionTime->format('Y-m-d_His'));
+        $safeStreetName = preg_replace('/[^\p{L}0-9_\-]/u', '_', $street);
+        $filename = sprintf('outages_%s_%s_%s.json', $safeCityName, $safeStreetName, $extractionTime->format('Y-m-d_His'));
         
         $dir = rtrim(self::JSON_OUTPUT_DIR, '/\\');
-        $outputPath = $dir . '/' . $filename;
+        $outputPath = $dir . DIRECTORY_SEPARATOR . $filename;
         
-        $jsonString = json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        
-        // Optimize: Check if file was successfully written
+        // Use JSON_UNESCAPED_SLASHES to keep URLs and dates clean
+        $jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES;
+        $jsonString = json_encode($output, $jsonFlags);
+
         if (file_put_contents($outputPath, $jsonString) !== false) {
             $this->logDebug("Results successfully saved to " . $outputPath);
         } else {
